@@ -25,15 +25,25 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
+          components: rustfmt
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
 
       - name: Validate embedded JavaScript
         run: node --check src/ui/app.js
+
+      - name: Test interface behavior
+        run: node --test tests/ui.test.cjs
 
       - name: Build release x64
         run: cargo build --release --locked --target x86_64-pc-windows-msvc
 
       - name: Run tests
-        run: cargo test --release --locked --target x86_64-pc-windows-msvc
+        run: cargo test --workspace --release --locked --target x86_64-pc-windows-msvc
+
+      - name: Verify native WOF round trips on NTFS
+        run: cargo test --release --locked --target x86_64-pc-windows-msvc -- --ignored --test-threads=1
 
       - name: Upload Compactor x64
         uses: actions/upload-artifact@v7

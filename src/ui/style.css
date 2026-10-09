@@ -108,6 +108,7 @@ textarea {
   height: 1.2em;
   overflow: hidden;
   white-space: nowrap;
+  text-overflow: ellipsis;
 }
 
 #Activity_Progress {
@@ -150,6 +151,62 @@ textarea {
   background-color: #5a4500;
   color: #fff1bd;
   font-size: 0.85em;
+}
+
+.notice {
+  margin: 8px 0;
+  padding: 8px 10px;
+  border: 1px solid #708899;
+  border-radius: 3px;
+  background-color: #263e4d;
+  color: #e3f2fc;
+  font-size: 0.85em;
+  line-height: 1.4;
+}
+
+.operation-report {
+  border: 1px solid #666;
+  border-radius: 5px;
+  padding: 10px 12px;
+  background-color: #333;
+}
+
+.operation-report h2 {
+  margin: 0 0 8px;
+  font-size: 0.95em;
+}
+
+.operation-counts {
+  display: flex;
+  flex-wrap: wrap;
+  font-size: 0.85em;
+}
+
+.operation-counts span {
+  margin: 0 16px 5px 0;
+}
+
+#Operation_Error_Details h3 {
+  margin: 6px 0;
+  color: #ffd1c7;
+  font-size: 0.85em;
+}
+
+#Operation_Errors {
+  max-height: 150px;
+  overflow: auto;
+  margin: 0;
+  padding-left: 20px;
+  list-style-type: disc;
+  color: #ffd1c7;
+  font-size: 0.8em;
+  line-height: 1.4;
+  word-wrap: break-word;
+}
+
+#Operation_Errors li {
+  display: list-item;
+  margin-bottom: 4px;
 }
 
 #File_Count_Breakdown {
@@ -201,6 +258,14 @@ section button {
 
 section button:hover, section button:active {
   background-color: #2289e6;
+}
+
+button:disabled,
+#Settings input:disabled,
+#Settings select:disabled,
+#Settings textarea:disabled {
+  cursor: default;
+  opacity: 0.5;
 }
 
 ul {
@@ -271,6 +336,11 @@ li {
   min-width: 120px;
   margin-left: 8px;
   font-size: 1em;
+}
+
+#Compressed_View_Mode {
+  font-size: 0.9em;
+  max-width: 120px;
 }
 
 #Compressed_View_Table_Wrap {

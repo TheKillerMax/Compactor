@@ -12,7 +12,7 @@ license = "MIT"
 #pango = { git = "https://github.com/gtk-rs/gtk-rs-core.git", package = "pango" }
 backtrace = "0.3.32"
 compresstimator = { git = "https://github.com/Freaky/compresstimator.git", rev = "26ddd3f499bc46f2c8b3ce814e9723ed41b47919" }
-crossbeam-channel = "0.5"
+crossbeam-channel = "0.5.17"
 ctrlc = "3.1"
 directories = "2.0.1"
 dirs-sys = "0.3.3"
@@ -30,7 +30,7 @@ serde_json = "1.0"
 siphasher = "0.3.0"
 walkdir = "2.3"
 web-view = { git = "https://github.com/Freaky/web-view", branch = "blocking-step" }
-winapi = { version = "0.3.7", features = [ "combaseapi", "fileapi", "ioapiset", "knownfolders", "processthreadsapi", "shellscalingapi", "shlobj", "shtypes", "sysinfoapi", "winbase", "winerror", "winioctl", "winver"] }
+winapi = { version = "0.3.7", features = [ "combaseapi", "fileapi", "handleapi", "synchapi", "ioapiset", "knownfolders", "processthreadsapi", "shellscalingapi", "shlobj", "shtypes", "sysinfoapi", "winbase", "winerror", "winioctl", "winver"] }
 filetime = "0.2.8"
 tinyfiledialogs = "3.3.10"
 wfd = "0.1.6"

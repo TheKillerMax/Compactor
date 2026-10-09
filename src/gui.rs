@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use crossbeam_channel::{bounded, Receiver};
+use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use dirs_sys::known_folder;
 use serde_derive::{Deserialize, Serialize};
 use web_view::*;
@@ -22,6 +22,7 @@ pub enum GuiRequest {
     SaveConfig {
         decimal: bool,
         compression: String,
+        analysis_mode: String,
         min_savings_percent: f32,
         max_threads: usize,
         hdd_single_thread: bool,
@@ -30,6 +31,7 @@ pub enum GuiRequest {
         excludes: String,
     },
     ResetConfig,
+    SettingsChanged,
     ChooseFolder,
     Compress,
     Decompress,
@@ -72,6 +74,7 @@ pub enum GuiResponse {
     Config {
         decimal: bool,
         compression: String,
+        analysis_mode: String,
         min_savings_percent: f32,
         max_threads: usize,
         hdd_single_thread: bool,
@@ -105,6 +108,15 @@ pub enum GuiResponse {
         physical_size: u64,
         items: Vec<CompressedViewItem>,
     },
+    AnalysisInvalidated,
+    OperationSummary {
+        operation: String,
+        changed: usize,
+        not_beneficial: usize,
+        skipped: usize,
+        failed: usize,
+        errors: Vec<String>,
+    },
     Paused,
     Resumed,
     Scanned,
@@ -119,6 +131,15 @@ impl<T> GuiWrapper<T> {
         let gui = Self(handle);
         gui.version();
         gui.config();
+        if let Some(error) = config().read().unwrap().load_error() {
+            gui.error(
+                "Settings could not be loaded",
+                format!(
+                    "Compactor is using defaults for this session. The original settings file was left unchanged.\n\n{}",
+                    error
+                ),
+            );
+        }
         gui
     }
 
@@ -142,16 +163,7 @@ impl<T> GuiWrapper<T> {
 
     pub fn config(&self) {
         let s = config().read().unwrap().current();
-        self.send(&GuiResponse::Config {
-            decimal: s.decimal,
-            compression: s.compression.to_string(),
-            min_savings_percent: s.min_savings_percent,
-            max_threads: s.max_threads,
-            hdd_single_thread: s.hdd_single_thread,
-            protect_direct_storage: s.protect_direct_storage,
-            compression_priority: s.compression_priority.to_string(),
-            excludes: s.excludes.join("\n"),
-        });
+        self.send(&config_response(&s));
     }
 
     pub fn summary(&self, info: FolderSummary) {
@@ -241,7 +253,9 @@ pub fn spawn_gui() {
         )
     );
 
-    let (from_gui, from_gui_rx) = bounded::<GuiRequest>(128);
+    // Never block the webview thread on a busy backend. UI state prevents new
+    // operation requests while one is active, and shutdown drops this sender.
+    let (from_gui, from_gui_rx) = unbounded::<GuiRequest>();
 
     let mut webview = web_view::builder()
         .title("Compactor")
@@ -258,6 +272,7 @@ pub fn spawn_gui() {
                 Ok(GuiRequest::SaveConfig {
                     decimal,
                     compression,
+                    analysis_mode,
                     min_savings_percent,
                     max_threads,
                     hdd_single_thread,
@@ -265,81 +280,56 @@ pub fn spawn_gui() {
                     compression_priority,
                     excludes,
                 }) => {
-                    let s = Config {
-                        decimal,
-                        compression: compression.parse().unwrap_or_default(),
-                        min_savings_percent,
-                        max_threads,
-                        hdd_single_thread,
-                        protect_direct_storage,
-                        compression_priority: compression_priority.parse().unwrap_or_default(),
-                        excludes: excludes.split('\n').map(str::to_owned).collect(),
-                    };
+                    let candidate = (|| {
+                        let s = Config {
+                            decimal,
+                            compression: compression
+                                .parse()
+                                .map_err(|_| "Choose a supported compression algorithm.".to_string())?,
+                            analysis_mode: analysis_mode
+                                .parse()
+                                .map_err(|_| "Choose a supported analysis mode.".to_string())?,
+                            min_savings_percent,
+                            max_threads,
+                            hdd_single_thread,
+                            protect_direct_storage,
+                            compression_priority: compression_priority
+                                .parse()
+                                .map_err(|_| "Choose a supported worker priority.".to_string())?,
+                            excludes: excludes.split('\n').map(str::to_owned).collect(),
+                        };
+                        s.validate()?;
+                        Ok::<Config, String>(s)
+                    })();
 
-                    if let Err(msg) = s.validate() {
-                        tinyfiledialogs::message_box_ok(
-                            "Settings Error",
-                            &msg,
-                            tinyfiledialogs::MessageBoxIcon::Error,
-                        );
-                    } else {
-                        message_dispatch(
-                            &mut webview,
-                            &GuiResponse::Config {
-                                decimal: s.decimal,
-                                compression: s.compression.to_string(),
-                                min_savings_percent: s.min_savings_percent,
-                                max_threads: s.max_threads,
-                                hdd_single_thread: s.hdd_single_thread,
-                                protect_direct_storage: s.protect_direct_storage,
-                                compression_priority: s.compression_priority.to_string(),
-                                excludes: s.excludes.join("\n"),
-                            },
-                        );
-                        let c = config();
-                        let mut c = c.write().unwrap();
-                        c.replace(s);
-                        if let Err(e) = c.save() {
-                            tinyfiledialogs::message_box_ok(
-                                "Settings Error",
-                                &format!("Error saving settings: {:?}", e),
-                                tinyfiledialogs::MessageBoxIcon::Error,
-                            );
-                        }
+                    match candidate {
+                        Ok(s) => update_config(&mut webview, &from_gui, s),
+                        Err(message) => settings_error(&message),
                     }
                 }
                 Ok(GuiRequest::ResetConfig) => {
-                    let s = Config::default();
-
-                    message_dispatch(
-                        &mut webview,
-                        &GuiResponse::Config {
-                            decimal: s.decimal,
-                            compression: s.compression.to_string(),
-                            min_savings_percent: s.min_savings_percent,
-                            max_threads: s.max_threads,
-                            hdd_single_thread: s.hdd_single_thread,
-                            protect_direct_storage: s.protect_direct_storage,
-                            compression_priority: s.compression_priority.to_string(),
-                            excludes: s.excludes.join("\n"),
-                        },
-                    );
-                    let c = config();
-                    let mut c = c.write().unwrap();
-                    c.replace(s);
-                    if let Err(e) = c.save() {
-                        tinyfiledialogs::message_box_ok(
-                            "Settings Error",
-                            &format!("Error saving settings: {:?}", e),
-                            tinyfiledialogs::MessageBoxIcon::Error,
+                    update_config(&mut webview, &from_gui, Config::default());
+                }
+                Ok(msg) => {
+                    if from_gui.send(msg).is_err() {
+                        message_dispatch(
+                            &mut webview,
+                            &GuiResponse::Error {
+                                title: "Operation unavailable".to_string(),
+                                message: "The background worker has stopped. Restart Compactor before continuing.".to_string(),
+                            },
                         );
                     }
                 }
-                Ok(msg) => {
-                    from_gui.send(msg).expect("GUI message queue");
-                }
                 Err(err) => {
                     eprintln!("Unhandled message {:?}: {:?}", arg, err);
+                    message_dispatch(
+                        &mut webview,
+                        &GuiResponse::Error {
+                            title: "Invalid request".to_string(),
+                            message: "The request could not be read. Check the settings values and try again.".to_string(),
+                        },
+                    );
                 }
             }
 
@@ -371,6 +361,55 @@ pub fn spawn_gui() {
     webview.into_inner();
 
     bg.join().expect("background thread");
+}
+
+fn config_response(s: &Config) -> GuiResponse {
+    GuiResponse::Config {
+        decimal: s.decimal,
+        compression: s.compression.to_string(),
+        analysis_mode: s.analysis_mode.to_string(),
+        min_savings_percent: s.min_savings_percent,
+        max_threads: s.max_threads,
+        hdd_single_thread: s.hdd_single_thread,
+        protect_direct_storage: s.protect_direct_storage,
+        compression_priority: s.compression_priority.to_string(),
+        excludes: s.excludes.join("\n"),
+    }
+}
+
+fn settings_error(message: &str) {
+    tinyfiledialogs::message_box_ok(
+        "Settings Error",
+        message,
+        tinyfiledialogs::MessageBoxIcon::Error,
+    );
+}
+
+fn update_config<T>(
+    webview: &mut web_view::WebView<'_, T>,
+    backend: &Sender<GuiRequest>,
+    settings: Config,
+) {
+    let response = config_response(&settings);
+    let result = config().write().unwrap().update(settings);
+    match result {
+        Ok(()) => {
+            message_dispatch(webview, &response);
+            if backend.send(GuiRequest::SettingsChanged).is_err() {
+                message_dispatch(
+                    webview,
+                    &GuiResponse::Error {
+                        title: "Settings saved".to_string(),
+                        message: "The background worker has stopped. Restart Compactor to use the saved settings.".to_string(),
+                    },
+                );
+            }
+        }
+        Err(err) => settings_error(&format!(
+            "Unable to save settings: {}\n\nThe previous settings are still active.",
+            err
+        )),
+    }
 }
 
 fn message_dispatch<T>(wv: &mut web_view::WebView<'_, T>, msg: &GuiResponse) {

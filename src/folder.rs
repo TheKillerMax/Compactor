@@ -19,19 +19,21 @@ use winapi::um::fileapi::{GetDiskFreeSpaceW, GetVolumeInformationW};
 use winapi::um::ioapiset::DeviceIoControl;
 use winapi::um::sysinfoapi::GetLogicalProcessorInformation;
 use winapi::um::winioctl::{
-    IOCTL_STORAGE_QUERY_PROPERTY, PropertyStandardQuery, StorageDeviceSeekPenaltyProperty,
+    PropertyStandardQuery, StorageDeviceSeekPenaltyProperty, IOCTL_STORAGE_QUERY_PROPERTY,
     STORAGE_PROPERTY_QUERY,
 };
 use winapi::um::winnt::{
-    BOOLEAN, FILE_ATTRIBUTE_COMPRESSED, FILE_ATTRIBUTE_ENCRYPTED, FILE_ATTRIBUTE_OFFLINE,
-    FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_SPARSE_FILE,
-    FILE_ATTRIBUTE_SYSTEM, FILE_ATTRIBUTE_TEMPORARY, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, HANDLE, RelationProcessorCore, SYSTEM_LOGICAL_PROCESSOR_INFORMATION,
+    RelationProcessorCore, BOOLEAN, FILE_ATTRIBUTE_COMPRESSED, FILE_ATTRIBUTE_ENCRYPTED,
+    FILE_ATTRIBUTE_OFFLINE, FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_REPARSE_POINT,
+    FILE_ATTRIBUTE_SPARSE_FILE, FILE_ATTRIBUTE_SYSTEM, FILE_ATTRIBUTE_TEMPORARY, FILE_SHARE_DELETE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, HANDLE, SYSTEM_LOGICAL_PROCESSOR_INFORMATION,
 };
 
 use crate::background::{Background, ControlToken};
-use crate::compact::Compression;
+use crate::compact::{self, Compression};
+use crate::config::{AnalysisMode, Config};
 use crate::persistence::{incompressible_key, pathdb};
+use crate::policy::{estimated_allocation, sample_is_candidate};
 
 const AUTO_MAX_ANALYSIS_THREADS: usize = 8;
 const AUTO_MAX_COMPRESSION_THREADS: usize = 16;
@@ -53,6 +55,7 @@ pub struct FileInfo {
     pub logical_size: u64,
     pub physical_size: u64,
     pub estimated_physical_size: u64,
+    pub compression: Option<Compression>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -67,12 +70,15 @@ pub struct GroupInfo {
 #[derive(Debug, Clone, Serialize)]
 pub struct FolderInfo {
     pub path: PathBuf,
+    pub canonical_root: PathBuf,
     pub logical_size: u64,
     pub physical_size: u64,
     pub compressible: GroupInfo,
     pub compressed: GroupInfo,
     pub skipped: GroupInfo,
     pub direct_storage: bool,
+    pub cluster_size: u64,
+    pub scan_errors: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -104,12 +110,15 @@ impl FolderInfo {
     pub fn new<P: AsRef<Path>>(path: P) -> Self {
         Self {
             path: path.as_ref().to_owned(),
+            canonical_root: path.as_ref().to_owned(),
             logical_size: 0,
             physical_size: 0,
             compressible: GroupInfo::default(),
             compressed: GroupInfo::default(),
             skipped: GroupInfo::default(),
             direct_storage: false,
+            cluster_size: FALLBACK_CLUSTER_SIZE,
+            scan_errors: 0,
         }
     }
 
@@ -205,30 +214,21 @@ impl GroupInfo {
 #[derive(Debug)]
 pub struct FolderScan {
     path: PathBuf,
+    canonical_root: PathBuf,
     excludes: GlobSet,
-    ratio_limit: f32,
-    compression: Compression,
-    max_threads: usize,
-    hdd_single_thread: bool,
+    config: Config,
 }
 
 impl FolderScan {
-    pub fn new<P: AsRef<Path>>(
-        path: P,
-        excludes: GlobSet,
-        ratio_limit: f32,
-        compression: Compression,
-        max_threads: usize,
-        hdd_single_thread: bool,
-    ) -> Self {
-        Self {
+    pub fn new<P: AsRef<Path>>(path: P, config: &Config) -> Result<Self, String> {
+        config.validate()?;
+        Ok(Self {
             path: path.as_ref().to_path_buf(),
-            excludes,
-            ratio_limit,
-            compression,
-            max_threads,
-            hdd_single_thread,
-        }
+            canonical_root: std::fs::canonicalize(path.as_ref())
+                .map_err(|error| format!("Unable to resolve scan root: {}", error))?,
+            excludes: config.globset()?,
+            config: config.clone(),
+        })
     }
 }
 
@@ -266,6 +266,7 @@ fn volume_root_path(path: &Path) -> Option<PathBuf> {
 
 fn normalized_path(path: &Path) -> String {
     path.to_string_lossy()
+        .trim_start_matches(r"\\?\")
         .replace('/', "\\")
         .trim_end_matches('\\')
         .to_ascii_lowercase()
@@ -341,6 +342,21 @@ fn cluster_size_for_path(path: &Path) -> u64 {
 }
 
 pub fn validate_target_path(path: &Path) -> Result<(), String> {
+    // Refuse aliases through junctions/mount points, including ancestor aliases.
+    // A textual C:\Games path must not redirect to Windows or another volume.
+    if !path.is_absolute() {
+        return Err("Select an absolute local folder path.".to_string());
+    }
+    for ancestor in path.ancestors() {
+        if let Ok(metadata) = std::fs::symlink_metadata(ancestor) {
+            if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return Err("Select the actual folder instead of a junction, symbolic link or mounted-folder alias.".to_string());
+            }
+        }
+    }
+    let canonical = std::fs::canonicalize(path)
+        .map_err(|error| format!("Unable to resolve the selected folder: {}", error))?;
+    let path = canonical.as_path();
     if !path.exists() {
         return Err("The selected folder no longer exists.".to_string());
     }
@@ -401,40 +417,6 @@ pub fn validate_target_path(path: &Path) -> Result<(), String> {
     }
 
     Ok(())
-}
-
-fn projection_factor(compression: Compression) -> f32 {
-    match compression {
-        Compression::Xpress4k => 1.05,
-        Compression::Xpress8k => 1.02,
-        Compression::Xpress16k => 1.00,
-        Compression::Lzx => 0.90,
-    }
-}
-
-fn round_up_to_cluster(size: u64, cluster_size: u64) -> u64 {
-    let cluster_size = cluster_size.max(1);
-    if size == 0 {
-        0
-    } else {
-        size.saturating_add(cluster_size - 1) / cluster_size * cluster_size
-    }
-}
-
-fn estimate_physical_size(
-    logical_size: u64,
-    ratio: f32,
-    compression: Compression,
-    cluster_size: u64,
-    current_physical_size: u64,
-) -> u64 {
-    if !ratio.is_finite() {
-        return current_physical_size;
-    }
-
-    let adjusted_ratio = (ratio.clamp(0.0, 1.0) * projection_factor(compression)).clamp(0.0, 1.0);
-    let estimated = ((logical_size as f64) * adjusted_ratio as f64).round() as u64;
-    round_up_to_cluster(estimated, cluster_size).min(current_physical_size)
 }
 
 fn volume_device_path(path: &Path) -> Option<PathBuf> {
@@ -510,9 +492,8 @@ fn physical_core_count() -> Option<usize> {
         let mut entries: Vec<SYSTEM_LOGICAL_PROCESSOR_INFORMATION> = Vec::with_capacity(capacity);
         let mut buffer_bytes = (capacity * entry_size) as DWORD;
 
-        let ret = unsafe {
-            GetLogicalProcessorInformation(entries.as_mut_ptr(), &mut buffer_bytes)
-        };
+        let ret =
+            unsafe { GetLogicalProcessorInformation(entries.as_mut_ptr(), &mut buffer_bytes) };
 
         if ret != 0 {
             let len = (buffer_bytes as usize / entry_size).min(capacity);
@@ -616,7 +597,7 @@ fn compresstimate_hdd(
     len: u64,
     buffer: &mut Vec<u8>,
 ) -> io::Result<f32> {
-    let chunk = HDD_SAMPLE_CHUNK.min(len as usize);
+    let chunk = len.min(HDD_SAMPLE_CHUNK as u64) as usize;
 
     if chunk == 0 {
         return Ok(1.0);
@@ -671,23 +652,31 @@ fn apply_estimate(
     mut fi: FileInfo,
     result: io::Result<f32>,
     ratio_limit: f32,
-    compression: Compression,
+    analysis_mode: AnalysisMode,
     cluster_size: u64,
 ) {
     match result {
-        Ok(ratio) if ratio < ratio_limit => {
-            fi.estimated_physical_size = estimate_physical_size(
-                fi.logical_size,
-                ratio,
-                compression,
-                cluster_size,
-                fi.physical_size,
-            );
-            fi.estimate_valid = true;
-            fi.estimated_ratio = ratio;
+        Ok(ratio) => {
+            fi.estimate_valid = ratio.is_finite() && (0.0..=1.0).contains(&ratio);
+            fi.estimated_ratio = if fi.estimate_valid { ratio } else { 1.0 };
+            fi.estimated_physical_size =
+                estimated_allocation(fi.logical_size, ratio, cluster_size, fi.physical_size);
+            if analysis_mode == AnalysisMode::Thorough || sample_is_candidate(ratio, ratio_limit) {
+                ds.push(FileKind::Compressible, fi);
+            } else {
+                ds.push(FileKind::Skipped, fi);
+            }
+        }
+        Err(_) if analysis_mode == AnalysisMode::Thorough => {
+            // Analysis is read-only and sampled; a transient read error is not
+            // proof of incompressibility. The protected worker will retry once.
+            ds.scan_errors += 1;
             ds.push(FileKind::Compressible, fi);
         }
-        Ok(_) | Err(_) => ds.push(FileKind::Skipped, fi),
+        Err(_) => {
+            ds.scan_errors += 1;
+            ds.push(FileKind::Skipped, fi);
+        }
     }
 }
 
@@ -697,7 +686,7 @@ fn estimate_candidates(
     workers: usize,
     hdd: bool,
     ratio_limit: f32,
-    compression: Compression,
+    analysis_mode: AnalysisMode,
     cluster_size: u64,
     control: &ControlToken<(PathBuf, FolderSummary)>,
     ds: &mut FolderInfo,
@@ -763,14 +752,7 @@ fn estimate_candidates(
             Ok((fi, result)) => {
                 in_flight -= 1;
                 let status_path = fi.path.clone();
-                apply_estimate(
-                    ds,
-                    fi,
-                    result,
-                    ratio_limit,
-                    compression,
-                    cluster_size,
-                );
+                apply_estimate(ds, fi, result, ratio_limit, analysis_mode, cluster_size);
 
                 if last_status.elapsed() >= Duration::from_millis(50) {
                     *last_status = Instant::now();
@@ -802,14 +784,7 @@ fn estimate_candidates(
 
     if cancelled {
         for (fi, result) in result_rx.try_iter() {
-            apply_estimate(
-                ds,
-                fi,
-                result,
-                ratio_limit,
-                compression,
-                cluster_size,
-            );
+            apply_estimate(ds, fi, result, ratio_limit, analysis_mode, cluster_size);
         }
 
         for candidate in candidates {
@@ -839,13 +814,14 @@ impl Background for FolderScan {
     fn run(self, control: &ControlToken<Self::Status>) -> Self::Output {
         let FolderScan {
             path,
+            canonical_root,
             excludes,
-            ratio_limit,
-            compression,
-            max_threads,
-            hdd_single_thread,
+            config,
         } = self;
+        let ratio_limit = config.ratio_limit();
+        let analysis_mode = config.analysis_mode;
         let mut ds = FolderInfo::new(&path);
+        ds.canonical_root = canonical_root;
         let cpus = thread::available_parallelism()
             .map(|count| count.get())
             .unwrap_or(1);
@@ -853,12 +829,13 @@ impl Background for FolderScan {
         let analysis_workers = worker_count_for_storage(
             cpus,
             seek_penalty,
-            max_threads,
-            hdd_single_thread,
+            config.max_threads,
+            config.hdd_single_thread,
             AUTO_MAX_ANALYSIS_THREADS,
         );
         let is_hdd = matches!(seek_penalty, Some(true));
         let cluster_size = cluster_size_for_path(&path);
+        ds.cluster_size = cluster_size;
         let mut candidates: VecDeque<EstimateCandidate> = VecDeque::new();
         let inline_estimator = if analysis_workers == 1 {
             Some(Compresstimator::with_block_size(ESTIMATOR_BLOCK_SIZE))
@@ -873,15 +850,52 @@ impl Background for FolderScan {
         let mut last_status = Instant::now();
 
         let walker = WalkDir::new(&path)
+            .follow_links(false)
             .into_iter()
-            .filter_entry(|e| e.file_type().is_file() || !excludes.is_match(e.path()))
-            .filter_map(|e| e.map_err(|e| eprintln!("Error: {:?}", e)).ok())
-            .filter(|e| e.file_type().is_file())
-            .filter_map(|e| e.metadata().map(|md| (e, md)).ok())
-            .filter_map(|(e, md)| e.path().size_on_disk().map(|s| (e, md, s)).ok())
-            .enumerate();
+            .filter_entry(|e| {
+                // Reparse directories can redirect an otherwise safe target to
+                // another volume or protected tree. Never descend into them.
+                if e.file_type().is_dir() {
+                    return e
+                        .metadata()
+                        .map(|md| {
+                            md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
+                                && !excludes.is_match(e.path())
+                        })
+                        .unwrap_or(false);
+                }
+                true
+            });
 
-        for (count, (entry, metadata, physical)) in walker {
+        for (count, result) in walker.enumerate() {
+            if control.is_cancelled_with_pause() {
+                for candidate in candidates {
+                    ds.push(FileKind::Skipped, candidate.file);
+                }
+                return Err(ds);
+            }
+            let entry = match result {
+                Ok(entry) if entry.file_type().is_file() => entry,
+                Ok(_) => continue,
+                Err(_) => {
+                    ds.scan_errors += 1;
+                    continue;
+                }
+            };
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(_) => {
+                    ds.scan_errors += 1;
+                    continue;
+                }
+            };
+            let physical = match entry.path().size_on_disk() {
+                Ok(size) => size,
+                Err(_) => {
+                    ds.scan_errors += 1;
+                    continue;
+                }
+            };
             let shortname = entry
                 .path()
                 .strip_prefix(&path)
@@ -893,7 +907,7 @@ impl Background for FolderScan {
             }
 
             let logical_size = metadata.len();
-            let fi = FileInfo {
+            let mut fi = FileInfo {
                 path: shortname,
                 content_len: metadata.len(),
                 modified_time: metadata.last_write_time(),
@@ -902,6 +916,7 @@ impl Background for FolderScan {
                 logical_size,
                 physical_size: physical,
                 estimated_physical_size: physical,
+                compression: None,
             };
 
             if count % 8 == 0 {
@@ -919,21 +934,46 @@ impl Background for FolderScan {
             }
 
             let attributes = metadata.file_attributes();
-            let special_attributes = FILE_ATTRIBUTE_COMPRESSED
+            let forbidden = FILE_ATTRIBUTE_COMPRESSED
                 | FILE_ATTRIBUTE_ENCRYPTED
-                | FILE_ATTRIBUTE_SPARSE_FILE
-                | FILE_ATTRIBUTE_REPARSE_POINT
-                | FILE_ATTRIBUTE_OFFLINE;
-
-            if attributes & special_attributes != 0 {
+                | FILE_ATTRIBUTE_OFFLINE
+                | FILE_ATTRIBUTE_SYSTEM
+                | FILE_ATTRIBUTE_TEMPORARY;
+            if attributes & forbidden != 0 {
                 ds.push(FileKind::Skipped, fi);
-            } else if fi.physical_size < fi.logical_size {
-                ds.push(FileKind::Compressed, fi);
-            } else if fi.content_len <= cluster_size
+                continue;
+            }
+            // WOF itself uses sparse/reparse metadata. Detect the actual provider
+            // before excluding these flags; size_on_disk < len is not a format.
+            let backing = compact::detect_compression(entry.path());
+            match backing {
+                Ok(Some(compression)) => {
+                    fi.compression = Some(compression);
+                    ds.push(FileKind::Compressed, fi);
+                    continue;
+                }
+                Err(_) => {
+                    ds.scan_errors += 1;
+                    ds.push(FileKind::Skipped, fi);
+                    continue;
+                }
+                Ok(None) => {}
+            }
+            if fi.content_len <= cluster_size
                 || attributes
-                    & (FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_TEMPORARY)
+                    & (FILE_ATTRIBUTE_READONLY
+                        | FILE_ATTRIBUTE_SPARSE_FILE
+                        | FILE_ATTRIBUTE_REPARSE_POINT)
                     != 0
-                || incompressible.contains(incompressible_key(entry.path(), &metadata))
+                || incompressible.contains(incompressible_key(
+                    entry.path(),
+                    metadata.len(),
+                    metadata.last_write_time(),
+                    config.compression,
+                    config.analysis_mode,
+                    config.min_savings_percent,
+                    cluster_size,
+                ))
                 || excludes.is_match(entry.path())
             {
                 ds.push(FileKind::Skipped, fi);
@@ -950,7 +990,7 @@ impl Background for FolderScan {
                     fi,
                     result,
                     ratio_limit,
-                    compression,
+                    analysis_mode,
                     cluster_size,
                 );
             } else {
@@ -967,7 +1007,7 @@ impl Background for FolderScan {
                         analysis_workers,
                         is_hdd,
                         ratio_limit,
-                        compression,
+                        analysis_mode,
                         cluster_size,
                         control,
                         &mut ds,
@@ -988,7 +1028,7 @@ impl Background for FolderScan {
                 analysis_workers,
                 is_hdd,
                 ratio_limit,
-                compression,
+                analysis_mode,
                 cluster_size,
                 control,
                 &mut ds,
@@ -1071,21 +1111,39 @@ fn lzx_auto_is_conservatively_capped_and_manual_is_respected() {
 }
 
 #[test]
-fn projection_is_algorithm_and_cluster_aware() {
-    let logical = 1024 * 1024;
-    let physical = logical;
-    let xpress = estimate_physical_size(
-        logical,
-        0.50,
-        Compression::Xpress16k,
+fn thorough_analysis_keeps_candidates_rejected_by_a_generic_sample() {
+    let file = || FileInfo {
+        path: PathBuf::from("fixture.bin"),
+        content_len: 65536,
+        modified_time: 0,
+        estimate_valid: false,
+        estimated_ratio: 1.0,
+        logical_size: 65536,
+        physical_size: 65536,
+        estimated_physical_size: 65536,
+        compression: None,
+    };
+    let mut sampled = FolderInfo::new("fixture");
+    apply_estimate(
+        &mut sampled,
+        file(),
+        Ok(1.0),
+        0.99,
+        AnalysisMode::Sampled,
         4096,
-        physical,
     );
-    let lzx = estimate_physical_size(logical, 0.50, Compression::Lzx, 4096, physical);
-
-    assert!(lzx < xpress);
-    assert_eq!(0, lzx % 4096);
-    assert_eq!(0, xpress % 4096);
+    assert_eq!(1, sampled.skipped.count);
+    let mut thorough = FolderInfo::new("fixture");
+    apply_estimate(
+        &mut thorough,
+        file(),
+        Ok(1.0),
+        0.99,
+        AnalysisMode::Thorough,
+        4096,
+    );
+    assert_eq!(1, thorough.compressible.count);
+    assert_eq!(65536, thorough.compressible.estimated_physical_size);
 }
 
 #[test]
@@ -1102,6 +1160,7 @@ fn skipped_files_keep_totals_without_retaining_paths() {
             logical_size: 8192,
             physical_size: 8192,
             estimated_physical_size: 8192,
+            compression: None,
         },
     );
 
@@ -1111,37 +1170,12 @@ fn skipped_files_keep_totals_without_retaining_paths() {
 }
 
 #[test]
-fn it_walks() {
-    use crate::background::BackgroundHandle;
-    use crate::config::Config;
-
-    let config = Config::default();
-    let gs = config.globset().unwrap();
-    let scanner = FolderScan::new(
-        "C:\\Games",
-        gs,
-        config.ratio_limit(),
-        config.compression,
-        config.max_threads,
-        config.hdd_single_thread,
-    );
-
-    let task = BackgroundHandle::spawn(scanner);
-
-    let deadline = Instant::now() + Duration::from_millis(2000);
-
-    loop {
-        let ret = task.wait_timeout(Duration::from_millis(100));
-
-        if ret.is_some() {
-            println!("Scanned: {:?}", ret);
-            break;
-        } else {
-            println!("Status: {:?}", task.status());
-        }
-
-        if Instant::now() > deadline {
-            task.cancel();
-        }
-    }
+fn scan_uses_an_isolated_fixture_and_accounts_for_empty_files() {
+    let dir = tempdir::TempDir::new("compactor-scan").unwrap();
+    std::fs::write(dir.path().join("empty.bin"), []).unwrap();
+    let scanner = FolderScan::new(dir.path(), &Config::default()).unwrap();
+    let result = scanner.run(&ControlToken::new()).unwrap();
+    assert_eq!(1, result.skipped.count);
+    assert_eq!(0, result.logical_size);
+    assert_eq!(0, result.compressible.count);
 }

@@ -1,6 +1,7 @@
 <!doctype html>
-<html>
+<html lang="en">
   <head>
+    <meta charset="utf-8">
     <style>{style}</style>
     <script>{script}</script>
   </head>
@@ -31,7 +32,7 @@
       <section id="Activity" style="display: none;">
         <div id="Activity_Text"></div>
         <div class="ctr">
-          <progress id="Activity_Progress"></progress>
+          <progress id="Activity_Progress" max="1" aria-label="Operation progress"></progress>
         </div>
       </section>
 
@@ -48,11 +49,18 @@
       </section>
 
       <section id="Analysis" style="display: none;">
+        <div id="Analysis_Invalidated" class="notice" style="display:none" role="status">
+          Analyse this folder again before compressing. The previous analysis is no longer current.
+        </div>
         <div>
-          <div class="saved"><span class="box">&nbsp;&nbsp;&nbsp;&nbsp;</span> <span id="Space_Saved">0 B</span> of <span id="Size_Logical">0 B</span> saved (<span id="Compress_Ratio">1.00</span>x, <span id="Size_Physical">0 B</span> on-disk)</div>
+          <div class="saved"><span class="box">&nbsp;&nbsp;&nbsp;&nbsp;</span> <span id="Space_Saved">0 B</span> saved in compressed files. Folder: <span id="Size_Logical">0 B</span> logical, <span id="Size_Physical">0 B</span> on-disk (<span id="Compress_Ratio">1.00</span>x size)</div>
           <div class="compressed"><span class="box">&nbsp;&nbsp;&nbsp;&nbsp;</span> <span id="Compressed_Size">0 B</span> in <span id="File_Count_Compressed">0</span> compressed <button id="Button_View_Compressed" class="details" style="display:none" title="View folders containing compressed files" onclick="Gui.open_compressed_view()">View</button></div>
-          <div class="compressible"><span class="box">&nbsp;&nbsp;&nbsp;&nbsp;</span> <span id="Compressible_Size">0 B</span> in <span id="File_Count_Compressible">0</span> compressible</div>
-          <div class="estimated"><span class="box">&nbsp;&nbsp;&nbsp;&nbsp;</span> Approx. after compacting: <span id="Estimated_Physical">0 B</span> on-disk (~<span id="Estimated_Savings">0 B</span> additional savings)</div>
+          <div class="compressible"><span class="box">&nbsp;&nbsp;&nbsp;&nbsp;</span> <span id="Compressible_Size">0 B</span> in <span id="File_Count_Compressible">0</span> candidate files</div>
+          <div class="estimated"><span class="box">&nbsp;&nbsp;&nbsp;&nbsp;</span>
+            <span id="Estimated_Sampled">Sample estimate after compacting: <span id="Estimated_Physical">0 B</span> on-disk (~<span id="Estimated_Savings">0 B</span> additional savings)</span>
+            <span id="Estimated_Thorough" style="display:none">Thorough mode: savings are measured during compression.</span>
+            <span id="Estimated_Stale" style="display:none">Analyse again to update candidates and estimates.</span>
+          </div>
           <div class="excluded"><span class="box">&nbsp;&nbsp;&nbsp;&nbsp;</span> <span id="Skipped_Size">0 B</span> in <span id="File_Count_Skipped">0</span> excluded</div>
         </div>
 
@@ -67,19 +75,38 @@
           <div id="Breakdown_Saved"></div>
         </div>
       </section>
+
+      <section id="Operation_Report" class="operation-report" style="display:none" aria-live="polite">
+        <h2 id="Operation_Title">Operation results</h2>
+        <div class="operation-counts">
+          <span><strong id="Operation_Changed">0</strong> changed</span>
+          <span><strong id="Operation_Not_Beneficial">0</strong> not beneficial</span>
+          <span><strong id="Operation_Skipped">0</strong> skipped</span>
+          <span><strong id="Operation_Failed">0</strong> failed</span>
+        </div>
+        <div id="Operation_Error_Details" style="display:none">
+          <h3 id="Operation_Error_Heading">Errors</h3>
+          <ul id="Operation_Errors"></ul>
+        </div>
+      </section>
     </section>
 
     <section class="page" id="CompressedFiles" style="display: none;">
       <div id="Compressed_View_Header">
         <button class="analyse" onclick="Gui.page('Compress')">Back</button>
-        <strong>Compressed Folders</strong>
+        <strong id="Compressed_View_Title">Compressed Folders</strong>
       </div>
 
       <div id="Compressed_View_Root"></div>
       <div id="Compressed_View_Summary"></div>
 
       <div id="Compressed_View_Controls">
-        <input id="Compressed_View_Search" type="search" placeholder="Filter folders by path" autocomplete="off" spellcheck="false">
+        <label for="Compressed_View_Mode">View</label>
+        <select id="Compressed_View_Mode">
+          <option value="folders">Folders</option>
+          <option value="files">Files</option>
+        </select>
+        <input id="Compressed_View_Search" type="search" aria-label="Filter compressed paths" placeholder="Filter folders by path" autocomplete="off" spellcheck="false">
       </div>
 
       <div id="Compressed_View_Table_Wrap">
@@ -97,6 +124,9 @@
     </section>
 
     <section class="page" id="Settings" style="display: none;">
+      <div id="Settings_Busy" class="notice" style="display:none" role="status">
+        Settings are available when the current operation finishes or stops.
+      </div>
       <div class="settings-panel">
         <div class="settings-heading">
           <h2>File exclusions</h2>
@@ -118,17 +148,27 @@
               <option value="XPRESS4K">XPRESS4K (fast, low compression)</option>
               <option value="XPRESS8K">XPRESS8K</option>
               <option value="XPRESS16K">XPRESS16K</option>
-              <option value="LZX">LZX (default, slow, high compression)</option>
+              <option value="LZX">LZX (default, high compression)</option>
             </select>
+            <small class="setting-help">LZX usually saves the most space among these native Windows methods. It uses more CPU time than XPRESS.</small>
           </label>
 
           <label class="setting-field">
-            <span class="setting-label">Minimum estimated savings</span>
+            <span class="setting-label">Analysis mode</span>
+            <select id="Analysis_Mode" name="Analysis_Mode">
+              <option value="Sampled">Sampled (faster)</option>
+              <option value="Thorough">Thorough (maximum coverage)</option>
+            </select>
+            <small id="Analysis_Mode_Help" class="setting-help">Uses a quick sample to skip files unlikely to benefit.</small>
+          </label>
+
+          <label class="setting-field">
+            <span class="setting-label">Minimum savings to keep</span>
             <span class="setting-inline">
               <input id="Min_Savings" name="Min_Savings" type="number" min="0" max="100" step="0.1" value="1">
               <span class="setting-suffix">%</span>
             </span>
-            <small class="setting-help">Files below this estimated saving are skipped.</small>
+            <small class="setting-help">Both modes keep compression only if measured on-disk savings meet this percentage and save at least one filesystem allocation unit. Unhelpful compression is removed.</small>
           </label>
 
           <label class="setting-field">

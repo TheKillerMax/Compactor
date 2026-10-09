@@ -1,6 +1,4 @@
 use crossbeam_channel::{Receiver, RecvTimeoutError};
-#[cfg(test)]
-use crossbeam_channel::TryRecvError;
 use std::panic::{catch_unwind, UnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -123,15 +121,6 @@ impl<T, S> BackgroundHandle<T, S> {
         }
     }
 
-    #[cfg(test)]
-    pub fn poll(&self) -> Option<T> {
-        match self.result.try_recv() {
-            Ok(value) => Some(value.unwrap()),
-            Err(TryRecvError::Empty) => None,
-            Err(e) => panic!("{:?}", e),
-        }
-    }
-
     pub fn wait_timeout(&self, wait: Duration) -> Option<T> {
         match self.result.recv_timeout(wait) {
             Ok(value) => Some(value.unwrap()),
@@ -140,11 +129,16 @@ impl<T, S> BackgroundHandle<T, S> {
         }
     }
 
-    pub fn wait(self) -> T {
-        match self.result.recv() {
-            Ok(value) => value.unwrap(),
-            Err(e) => panic!("{:?}", e),
-        }
+    /// Inspect completion without consuming it, so coordinators can detect a
+    /// worker that exited before reporting its active file.
+    pub fn is_finished(&self) -> bool {
+        !self.result.is_empty()
+    }
+
+    pub fn wait_result(self) -> std::thread::Result<T> {
+        self.result
+            .recv()
+            .unwrap_or_else(|_| Err(Box::new("Background worker disconnected before returning")))
     }
 
     pub fn cancel(&self) {
@@ -184,74 +178,66 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    #[derive(Debug, Clone, Copy)]
-    pub struct Tick;
+    struct Stepped {
+        steps: Receiver<()>,
+        events: crossbeam_channel::Sender<u32>,
+    }
 
-    impl Background for Tick {
+    impl Background for Stepped {
         type Output = Result<u32, u32>;
         type Status = u32;
 
         fn run(self, control: &ControlToken<Self::Status>) -> Self::Output {
-            let mut ticks = 0;
-
-            while ticks < 100 && !control.is_cancelled_with_pause() {
-                ticks += 1;
-                control.set_status(ticks);
-
-                thread::sleep(Duration::from_millis(10));
+            let mut count = 0;
+            while !control.is_cancelled_with_pause() {
+                match self.steps.recv_timeout(Duration::from_millis(10)) {
+                    Ok(()) => {
+                        if control.is_cancelled_with_pause() {
+                            break;
+                        }
+                        count += 1;
+                        control.set_status(count);
+                        self.events.send(count).unwrap();
+                    }
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
             }
-
-            control.result().map(|_| ticks).map_err(|_| ticks)
+            control.result().map(|_| count).map_err(|_| count)
         }
     }
 
     #[test]
-    fn it_cancels() {
-        let task = Tick;
-
-        let handle = BackgroundHandle::spawn(task);
-
-        for _ in 0..10 {
-            thread::sleep(Duration::from_millis(10));
-            let got = handle.poll();
-            assert!(got.is_none());
-        }
-
+    fn cancellation_finishes_after_the_acknowledged_step() {
+        let (send, steps) = crossbeam_channel::unbounded();
+        let (events, receive) = crossbeam_channel::unbounded();
+        let handle = BackgroundHandle::spawn(Stepped { steps, events });
+        send.send(()).unwrap();
+        assert_eq!(1, receive.recv_timeout(Duration::from_secs(2)).unwrap());
         handle.cancel();
-
-        let ret = handle.wait();
-        assert!(ret.is_err());
-        let ticks = ret.unwrap_err();
-        assert!(9 <= ticks && ticks <= 12);
+        assert_eq!(Some(Err(1)), handle.wait_timeout(Duration::from_secs(2)));
     }
 
     #[test]
-    fn it_pauses() {
-        let task = Tick;
-
-        let handle = BackgroundHandle::spawn(task);
-
+    fn pause_stops_work_and_cancel_wakes_a_paused_task() {
+        let (send, steps) = crossbeam_channel::unbounded();
+        let (events, receive) = crossbeam_channel::unbounded();
+        let handle = BackgroundHandle::spawn(Stepped { steps, events });
         handle.pause();
-
-        for _ in 0..10 {
-            thread::sleep(Duration::from_millis(10));
-            let got = handle.poll();
-            assert!(got.is_none());
-        }
-
+        send.send(()).unwrap();
+        assert!(matches!(
+            receive.recv_timeout(Duration::from_millis(100)),
+            Err(RecvTimeoutError::Timeout)
+        ));
         handle.resume();
-
-        for _ in 0..10 {
-            thread::sleep(Duration::from_millis(10));
-            let got = handle.poll();
-            assert!(got.is_none());
-        }
-
+        assert_eq!(1, receive.recv_timeout(Duration::from_secs(2)).unwrap());
+        handle.pause();
+        send.send(()).unwrap();
+        assert!(matches!(
+            receive.recv_timeout(Duration::from_millis(100)),
+            Err(RecvTimeoutError::Timeout)
+        ));
         handle.cancel();
-
-        let ret = handle.wait();
-        assert!(ret.is_err());
-        let ticks = ret.unwrap_err();
-        assert!(9 <= ticks && ticks <= 12);
+        assert_eq!(Some(Err(1)), handle.wait_timeout(Duration::from_secs(2)));
     }
 }

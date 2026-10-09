@@ -63,6 +63,15 @@ var Util = (function() {
 			return number.toLocaleString("en", {minimumFractionDigits: digits, maximumFractionDigits: digits});
 		},
 
+		setting_number: function(value, minimum, maximum, integer) {
+			var text = String(value).replace(/^\s+|\s+$/g, "");
+			if (!/^[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[-+]?\d+)?$/i.test(text)) return null;
+			var number = Number(text);
+			if (!isFinite(number) || number < minimum || number > maximum) return null;
+			if (integer && Math.floor(number) !== number) return null;
+			return number;
+		},
+
 		bytes_to_human_dec: function(bytes) {
 			for (var i = powers.length - 1; i > 0; i--) {
 				var div = Math.pow(10, 3 * i);
@@ -150,31 +159,42 @@ var Action = (function() {
 		},
 
 		reset_config: function() {
+			if (Gui.is_busy()) return;
 			external.invoke(JSON.stringify({ type: 'ResetConfig' }));
 		},
 
 		save_config: function(config) {
+			if (Gui.is_busy()) return;
 			config.type = 'SaveConfig';
 			external.invoke(JSON.stringify(config));
 		},
 
 		choose_folder: function() {
+			if (Gui.is_busy()) return;
+			Gui.operation_requested();
 			external.invoke(JSON.stringify({ type: 'ChooseFolder' }));
 		},
 
 		compress: function() {
+			if (Gui.is_busy() || Gui.needs_analysis()) return;
+			Gui.operation_requested();
 			external.invoke(JSON.stringify({ type: 'Compress' }));
 		},
 
 		decompress: function() {
+			if (Gui.is_busy()) return;
+			Gui.operation_requested();
 			external.invoke(JSON.stringify({ type: 'Decompress' }));
 		},
 
 		decompress_and_exclude: function() {
+			if (Gui.is_busy()) return;
+			Gui.operation_requested();
 			external.invoke(JSON.stringify({ type: 'DecompressAndExclude' }));
 		},
 
 		view_compressed: function(view, query, page) {
+			if (Gui.is_busy()) return;
 			external.invoke(JSON.stringify({
 				type: 'ViewCompressed',
 				view: view,
@@ -192,6 +212,8 @@ var Action = (function() {
 		},
 
 		analyse: function() {
+			if (Gui.is_busy()) return;
+			Gui.operation_requested();
 			external.invoke(JSON.stringify({ type: 'Analyse' }));
 		},
 
@@ -217,6 +239,7 @@ var Response = (function() {
 			case "Config":
 				Gui.set_decimal(msg.decimal);
 				Gui.set_compression(msg.compression);
+				Gui.set_analysis_mode(msg.analysis_mode || "Sampled");
 				Gui.set_min_savings(msg.min_savings_percent);
 				Gui.set_max_threads(msg.max_threads);
 				Gui.set_compression_priority(msg.compression_priority);
@@ -238,6 +261,7 @@ var Response = (function() {
 				break;
 
 			case "Error":
+				Gui.operation_start_failed();
 				window.alert(msg.title + "\n\n" + msg.message);
 				break;
 
@@ -255,6 +279,14 @@ var Response = (function() {
 
 			case "CompressedView":
 				Gui.set_compressed_view(msg);
+				break;
+
+			case "AnalysisInvalidated":
+				Gui.analysis_invalidated();
+				break;
+
+			case "OperationSummary":
+				Gui.set_operation_summary(msg);
 				break;
 		}
 	};
@@ -299,6 +331,13 @@ var Response = (function() {
 var Gui = (function() {
 	"use strict";
 
+	var busy = false;
+	var awaitingOperation = false;
+	var analysisDirty = false;
+	var analysisMode = "Sampled";
+	var lastFolderSummary = null;
+	var lastCompressedView = null;
+
 	var compressedView = {
 		view: "folders",
 		page: 0,
@@ -309,10 +348,25 @@ var Gui = (function() {
 		Gui.request_compressed(0);
 	}, 200);
 
-	var addTableCell = function(row, value, className) {
-		var cell = $("<td></td>").text(value);
+	var addTableCell = function(row, value, className, header) {
+		var cell = $(header ? "<th></th>" : "<td></td>").text(value);
+		if (header) cell.attr("scope", "col");
 		if (className) cell.addClass(className);
 		row.append(cell);
+	};
+
+	var setBusy = function(active) {
+		busy = active;
+		$("#Button_Folder, #Button_Save, #Button_Reset, #Button_Analyse, #Button_Compress, #Button_Decompress, #Button_Decompress_Exclude, #Button_View_Compressed, #Settings input, #Settings select, #Settings textarea")
+			.prop("disabled", active);
+		$("#Settings_Busy").toggle(active);
+	};
+
+	var updateEstimateDisplay = function() {
+		$("#Estimated_Sampled").toggle(!analysisDirty && analysisMode === "Sampled");
+		$("#Estimated_Thorough").toggle(!analysisDirty && analysisMode === "Thorough");
+		$("#Estimated_Stale").toggle(analysisDirty);
+		$("#Analysis_Invalidated").toggle(analysisDirty);
 	};
 
 	return {
@@ -323,29 +377,63 @@ var Gui = (function() {
 				return false;
 			});
 
-			$("#Button_Save").on("click", function() {
-				var minSavings = parseFloat($("#Min_Savings").val());
-				if (isNaN(minSavings)) minSavings = 1;
-				var maxThreads = parseInt($("#Max_Threads").val(), 10);
-				if (isNaN(maxThreads)) maxThreads = 0;
-
-				Action.save_config({
-					decimal: $("#SI_Units").val() == "D",
-					compression: $("#Compression_Mode").val(),
-					min_savings_percent: minSavings,
-					max_threads: maxThreads,
-					compression_priority: $("#Compression_Priority").val(),
-					hdd_single_thread: $("#HDD_Single_Thread").prop("checked"),
-					protect_direct_storage: $("#Protect_DirectStorage").prop("checked"),
-					excludes: $("#Excludes").val()
-				});
-			});
+			$("#Button_Save").on("click", Gui.save_settings);
 
 			$("#Button_Reset").on("click", function() {
 				Action.reset_config();
 			});
 
 			$("#Compressed_View_Search").on("input", compressedSearch);
+			$("#Compressed_View_Mode").on("change", function() {
+				Gui.set_compressed_mode($(this).val());
+			});
+			$("#Analysis_Mode").on("change", function() {
+				Gui.update_analysis_help($(this).val());
+			});
+			Gui.update_analysis_help("Sampled");
+		},
+
+		is_busy: function() {
+			return busy;
+		},
+
+		needs_analysis: function() {
+			return analysisDirty;
+		},
+
+		operation_requested: function() {
+			awaitingOperation = true;
+			setBusy(true);
+		},
+
+		operation_start_failed: function() {
+			if (awaitingOperation) Gui.scanned();
+		},
+
+		save_settings: function() {
+			if (busy) return;
+			var minSavings = Util.setting_number($("#Min_Savings").val(), 0, 100, false);
+			if (minSavings === null) {
+				window.alert("Minimum savings must be a number between 0 and 100%.");
+				return;
+			}
+			var maxThreads = Util.setting_number($("#Max_Threads").val(), 0, 16, true);
+			if (maxThreads === null) {
+				window.alert("Maximum worker threads must be a whole number from 0 (Auto) to 16.");
+				return;
+			}
+
+			Action.save_config({
+				decimal: $("#SI_Units").val() == "D",
+				compression: $("#Compression_Mode").val(),
+				analysis_mode: $("#Analysis_Mode").val(),
+				min_savings_percent: minSavings,
+				max_threads: maxThreads,
+				compression_priority: $("#Compression_Priority").val(),
+				hdd_single_thread: $("#HDD_Single_Thread").prop("checked"),
+				protect_direct_storage: $("#Protect_DirectStorage").prop("checked"),
+				excludes: $("#Excludes").val()
+			});
 		},
 
 		page: function(page) {
@@ -356,11 +444,21 @@ var Gui = (function() {
 		},
 
 		open_compressed_view: function() {
-			compressedView.view = "folders";
+			if (busy) return;
+			compressedSearch.clear();
 			compressedView.page = 0;
 			compressedView.pages = 1;
+			$("#Compressed_View_Mode").val(compressedView.view);
 			$("#Compressed_View_Search").val("");
 			Gui.page("CompressedFiles");
+			Gui.request_compressed(0);
+		},
+
+		set_compressed_mode: function(view) {
+			if (busy) return;
+			compressedSearch.clear();
+			compressedView.view = view === "files" ? "files" : "folders";
+			$("#Compressed_View_Mode").val(compressedView.view);
 			Gui.request_compressed(0);
 		},
 
@@ -376,10 +474,20 @@ var Gui = (function() {
 		},
 
 		set_compressed_view: function(data) {
-			compressedView.view = "folders";
+			// A search/mode can change while an earlier request is in flight.
+			// Keep that earlier response from replacing the user's latest view.
+			var view = data.view === "files" ? "files" : "folders";
+			var query = String($("#Compressed_View_Search").val() || "").replace(/^\s+|\s+$/g, "");
+			if (view !== compressedView.view || data.query !== query) return;
+			lastCompressedView = data;
 			compressedView.page = data.page;
 			compressedView.pages = data.pages;
+			var folders = view === "folders";
+			var itemName = folders ? "folders" : "files";
+			var columns = folders ? 5 : 4;
 
+			$("#Compressed_View_Title").text(folders ? "Compressed Folders" : "Compressed Files");
+			$("#Compressed_View_Search").attr("placeholder", "Filter " + itemName + " by path");
 			$("#Compressed_View_Root").text(data.root);
 			$("#Compressed_View_Summary").text(
 				Util.format_number(data.compressed_count, 0) + " compressed files - " +
@@ -392,16 +500,16 @@ var Gui = (function() {
 			var body = $("#Compressed_View_Body").empty();
 			var header = $("<tr></tr>");
 
-			addTableCell(header, "Files");
-			addTableCell(header, "Logical");
-			addTableCell(header, "On-disk");
-			addTableCell(header, "Saved");
-			addTableCell(header, "Folder", "path");
+			if (folders) addTableCell(header, "Files", null, true);
+			addTableCell(header, "Logical", null, true);
+			addTableCell(header, "On-disk", null, true);
+			addTableCell(header, "Saved", null, true);
+			addTableCell(header, folders ? "Folder" : "File", "path", true);
 			head.append(header);
 
 			data.items.forEach(function(item) {
 				var row = $("<tr></tr>");
-				addTableCell(row, Util.format_number(item.count, 0));
+				if (folders) addTableCell(row, Util.format_number(item.count, 0));
 				addTableCell(row, Util.bytes_to_human(item.logical_size));
 				addTableCell(row, Util.bytes_to_human(item.physical_size));
 				addTableCell(row, Util.bytes_to_human(Math.max(0, item.logical_size - item.physical_size)));
@@ -413,9 +521,9 @@ var Gui = (function() {
 				var empty = $("<tr></tr>");
 				empty.append(
 					$("<td></td>")
-						.attr("colspan", 5)
+						.attr("colspan", columns)
 						.addClass("empty")
-						.text("No matching compressed folders")
+						.text("No matching compressed " + itemName)
 				);
 				body.append(empty);
 			}
@@ -423,7 +531,7 @@ var Gui = (function() {
 			$("#Compressed_View_Page").text(
 				"Page " + Util.format_number(data.page + 1, 0) + " of " +
 				Util.format_number(data.pages, 0) + " - " +
-				Util.format_number(data.total, 0) + " folders"
+				Util.format_number(data.total, 0) + " " + itemName
 			);
 			$("#Button_Compressed_Previous").prop("disabled", data.page <= 0);
 			$("#Button_Compressed_Next").prop("disabled", data.page + 1 >= data.pages);
@@ -443,10 +551,25 @@ var Gui = (function() {
 				field.val("I");
 				Util.bytes_to_human = Util.bytes_to_human_bin;
 			}
+			if (lastFolderSummary) Gui.set_folder_summary(lastFolderSummary);
+			if (lastCompressedView) Gui.set_compressed_view(lastCompressedView);
 		},
 
 		set_compression: function(compression) {
-			$("#Compression_Mode").val(compression);
+			$("#Compression_Mode").val(String(compression).toUpperCase());
+		},
+
+		set_analysis_mode: function(mode) {
+			analysisMode = mode === "Thorough" ? "Thorough" : "Sampled";
+			$("#Analysis_Mode").val(analysisMode);
+			Gui.update_analysis_help(analysisMode);
+			updateEstimateDisplay();
+		},
+
+		update_analysis_help: function(mode) {
+			$("#Analysis_Mode_Help").text(mode === "Thorough"
+				? "Tries every eligible file without the sampling filter. This can find extra savings, but takes longer and may perform more writes."
+				: "Uses a quick sample to skip files unlikely to benefit. Some files that would compress well may be missed.");
 		},
 
 		set_min_savings: function(percent) {
@@ -489,15 +612,21 @@ var Gui = (function() {
 		},
 
 		set_status: function(status, pct) {
-			$("#Activity_Text").text(status);
-			if (pct != null) {
-				$("#Activity_Progress").val(pct);
+			$("#Activity_Text").text(status).attr("title", status);
+			if (typeof pct === "number" && isFinite(pct)) {
+				$("#Activity_Progress").val(Math.max(0, Math.min(1, pct)));
 			} else {
 				$("#Activity_Progress").removeAttr("value");
 			}
 		},
 
 		scanning: function() {
+			awaitingOperation = false;
+			setBusy(true);
+			analysisDirty = false;
+			lastCompressedView = null;
+			compressedSearch.clear();
+			Gui.clear_operation_summary();
 			Gui.reset_folder_summary();
 			$("#Activity").show();
 			$("#Analysis").show();
@@ -513,6 +642,10 @@ var Gui = (function() {
 		},
 
 		compacting: function() {
+			awaitingOperation = false;
+			setBusy(true);
+			Gui.clear_operation_summary();
+			$("#Activity").show();
 			$("#Button_Pause").show();
 			$("#Button_Resume").hide();
 			$("#Button_Stop").show();
@@ -538,18 +671,20 @@ var Gui = (function() {
 		},
 
 		scanned: function() {
+			awaitingOperation = false;
+			setBusy(false);
 			$("#Button_Pause").hide();
 			$("#Button_Resume").hide();
 			$("#Button_Stop").hide();
 			$("#Button_Analyse").show();
 
-			if ($("#File_Count_Compressible").text() != "0") {
+			if (!analysisDirty && lastFolderSummary && lastFolderSummary.compressible.count > 0) {
 				$("#Button_Compress").show();
 			} else {
 				$("#Button_Compress").hide();
 			}
 
-			if ($("#File_Count_Compressed").text() != "0") {
+			if (lastFolderSummary && lastFolderSummary.compressed.count > 0) {
 				$("#Button_Decompress").show();
 				$("#Button_Decompress_Exclude").show();
 				$("#Button_View_Compressed").show();
@@ -558,6 +693,35 @@ var Gui = (function() {
 				$("#Button_Decompress_Exclude").hide();
 				$("#Button_View_Compressed").hide();
 			}
+		},
+
+		analysis_invalidated: function() {
+			analysisDirty = true;
+			$("#Button_Compress").hide();
+			updateEstimateDisplay();
+		},
+
+		clear_operation_summary: function() {
+			$("#Operation_Report").hide();
+			$("#Operation_Errors").empty();
+		},
+
+		set_operation_summary: function(data) {
+			$("#Operation_Title").text(data.operation + " results");
+			$("#Operation_Changed").text(Util.format_number(data.changed, 0));
+			$("#Operation_Not_Beneficial").text(Util.format_number(data.not_beneficial, 0));
+			$("#Operation_Skipped").text(Util.format_number(data.skipped, 0));
+			$("#Operation_Failed").text(Util.format_number(data.failed, 0));
+			var errors = data.errors || [];
+			var list = $("#Operation_Errors").empty();
+			errors.forEach(function(error) {
+				list.append($("<li></li>").text(error));
+			});
+			$("#Operation_Error_Heading").text(data.failed > errors.length
+				? "Errors (showing " + Util.format_number(errors.length, 0) + " of " + Util.format_number(data.failed, 0) + ")"
+				: "Errors");
+			$("#Operation_Error_Details").toggle(errors.length > 0);
+			$("#Operation_Report").show();
 		},
 
 		reset_folder_summary: function() {
@@ -572,6 +736,7 @@ var Gui = (function() {
 		},
 
 		set_folder_summary: function(data) {
+			lastFolderSummary = data;
 			$("#Size_Logical").text(Util.bytes_to_human(data.logical_size));
 			$("#Size_Physical").text(Util.bytes_to_human(data.physical_size));
 
@@ -586,12 +751,14 @@ var Gui = (function() {
 			$("#Compressible_Size").text(Util.bytes_to_human(data.compressible.physical_size));
 			$("#Skipped_Size").text(Util.bytes_to_human(data.skipped.physical_size));
 
-			if (data.physical_size > 0) {
-				var total = data.physical_size;
-				document.getElementById("Breakdown_Compressed").style.width = "" + 100 * (data.compressed.physical_size / total).toFixed(2) + "%";
-				document.getElementById("Breakdown_Compressible").style.width = "" + 100 * (data.compressible.physical_size / total).toFixed(2) + "%";
-				document.getElementById("Breakdown_Skipped").style.width = "" + 100 * (data.skipped.physical_size / total).toFixed(2) + "%";
-			}
+			var total = data.physical_size;
+			var width = function(size) {
+				return (total > 0 ? Math.max(0, Math.min(100, 100 * size / total)) : 0).toFixed(2) + "%";
+			};
+			document.getElementById("Breakdown_Compressed").style.width = width(data.compressed.physical_size);
+			document.getElementById("Breakdown_Compressible").style.width = width(data.compressible.physical_size);
+			document.getElementById("Breakdown_Skipped").style.width = width(data.skipped.physical_size);
+			$("#File_Count_Breakdown").toggle(total > 0);
 
 			var estimatedCandidateSize = data.compressible.estimated_physical_size;
 			if (estimatedCandidateSize === undefined || estimatedCandidateSize === null) {
@@ -608,6 +775,7 @@ var Gui = (function() {
 			$("#File_Count_Compressible").text(Util.format_number(data.compressible.count, 0));
 			$("#File_Count_Skipped").text(Util.format_number(data.skipped.count, 0));
 			$("#DirectStorage_Warning").toggle(!!data.direct_storage);
+			updateEstimateDisplay();
 		},
 
 		analysis_complete: function() {

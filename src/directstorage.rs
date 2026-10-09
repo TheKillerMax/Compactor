@@ -1,4 +1,6 @@
+use crate::background::{Background, ControlToken};
 use std::collections::HashSet;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use walkdir::WalkDir;
@@ -47,6 +49,7 @@ fn lower_name(path: &Path) -> String {
 fn normalized(path: &Path) -> String {
     let value = path
         .to_string_lossy()
+        .trim_start_matches(r"\\?\")
         .replace('/', "\\")
         .trim_end_matches('\\')
         .to_ascii_lowercase();
@@ -66,6 +69,10 @@ fn normalized(path: &Path) -> String {
     }
 }
 
+pub fn same_path(left: &Path, right: &Path) -> bool {
+    normalized(left) == normalized(right)
+}
+
 pub fn is_under(path: &Path, root: &Path) -> bool {
     let path = normalized(path);
     let root = normalized(root);
@@ -78,7 +85,9 @@ pub fn is_under(path: &Path, root: &Path) -> bool {
 
 pub fn is_direct_storage_runtime(path: &Path) -> bool {
     let name = lower_name(path);
-    DIRECT_STORAGE_DLLS.iter().any(|candidate| *candidate == name)
+    DIRECT_STORAGE_DLLS
+        .iter()
+        .any(|candidate| *candidate == name)
 }
 
 fn is_drive_root(path: &Path) -> bool {
@@ -87,13 +96,15 @@ fn is_drive_root(path: &Path) -> bool {
 
 fn is_library_container(path: &Path) -> bool {
     let name = lower_name(path);
-    if LIBRARY_CONTAINERS.iter().any(|candidate| *candidate == name) {
+    if LIBRARY_CONTAINERS
+        .iter()
+        .any(|candidate| *candidate == name)
+    {
         return true;
     }
 
     let parent = path.parent().map(lower_name).unwrap_or_default();
-    (name == "common" && parent == "steamapps")
-        || (name == "library" && parent == "amazon games")
+    (name == "common" && parent == "steamapps") || (name == "library" && parent == "amazon games")
 }
 
 fn too_wide_to_skip(path: &Path) -> bool {
@@ -138,11 +149,7 @@ fn safe_root(candidate: PathBuf, dll_path: &Path, scan_root: &Path) -> PathBuf {
     candidate
 }
 
-fn infer_game_root(
-    dll_path: &Path,
-    scan_root: &Path,
-    exe_dirs: &HashSet<String>,
-) -> PathBuf {
+fn infer_game_root(dll_path: &Path, scan_root: &Path, exe_dirs: &HashSet<String>) -> PathBuf {
     let dll_parent = dll_path.parent().unwrap_or(scan_root);
 
     if let Some(root) = unreal_project_root(dll_parent) {
@@ -216,19 +223,44 @@ fn collapse_roots(mut roots: Vec<PathBuf>) -> Vec<PathBuf> {
     kept
 }
 
-pub fn discover_direct_storage_roots(scan_root: &Path) -> Vec<PathBuf> {
+pub struct DirectStorageScan {
+    pub path: PathBuf,
+}
+
+impl Background for DirectStorageScan {
+    type Output = io::Result<Vec<PathBuf>>;
+    type Status = ();
+
+    fn run(self, control: &ControlToken<()>) -> Self::Output {
+        discover_direct_storage_roots(&self.path, || control.is_cancelled_with_pause())
+    }
+}
+
+fn discover_direct_storage_roots(
+    scan_root: &Path,
+    mut cancelled: impl FnMut() -> bool,
+) -> io::Result<Vec<PathBuf>> {
     let mut dlls = Vec::new();
     let mut exe_dirs = HashSet::new();
 
-    for entry in WalkDir::new(scan_root)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_file())
-    {
+    for entry in WalkDir::new(scan_root).follow_links(false).into_iter() {
+        if cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "DirectStorage check stopped",
+            ));
+        }
+        // An incomplete detection cannot establish that an unreadable subtree
+        // is safe. Report the failure before transforming any files.
+        let entry = entry.map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
         let path = entry.path();
+        // A named runtime link is still evidence of DirectStorage. Record its
+        // name without following it into an unselected tree.
         if is_direct_storage_runtime(path) {
             dlls.push(path.to_path_buf());
+        }
+        if !entry.file_type().is_file() {
+            continue;
         }
 
         if path
@@ -242,17 +274,34 @@ pub fn discover_direct_storage_roots(scan_root: &Path) -> Vec<PathBuf> {
         }
     }
 
-    collapse_roots(
-        dlls
-            .iter()
+    Ok(collapse_roots(
+        dlls.iter()
             .map(|dll| infer_game_root(dll, scan_root, &exe_dirs))
             .collect(),
-    )
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detection_is_cancellable_and_does_not_use_compression_exclusions() {
+        let dir = tempdir::TempDir::new("compactor-directstorage").unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        std::fs::write(bin.join("dstorage.dll"), []).unwrap();
+        assert_eq!(
+            vec![dir.path().to_path_buf()],
+            discover_direct_storage_roots(dir.path(), || false).unwrap()
+        );
+        assert_eq!(
+            io::ErrorKind::Interrupted,
+            discover_direct_storage_roots(dir.path(), || true)
+                .unwrap_err()
+                .kind()
+        );
+    }
 
     #[test]
     fn steam_unreal_runtime_maps_to_game_root() {
@@ -284,6 +333,22 @@ mod tests {
         let dll = Path::new(r"D:\Games\ExampleGame\bin\dstoragecore.dll");
         let root = infer_game_root(dll, scan, &HashSet::new());
         assert_eq!(normalized(&root), normalized(scan));
+    }
+
+    #[test]
+    fn scope_comparison_accepts_verbatim_prefix_but_respects_directory_boundaries() {
+        assert!(is_under(
+            Path::new(r"\\?\C:\Games\A\data.bin"),
+            Path::new(r"c:\games\a")
+        ));
+        assert!(!is_under(
+            Path::new(r"C:\Games\AB\data.bin"),
+            Path::new(r"C:\Games\A")
+        ));
+        assert!(!is_under(
+            Path::new(r"D:\Games\A\data.bin"),
+            Path::new(r"C:\Games\A")
+        ));
     }
 
     #[test]

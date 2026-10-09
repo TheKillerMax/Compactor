@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+### Added
+
+- Optional Thorough analysis, which tries the selected WOF algorithm on every eligible, uncached file instead of rejecting candidates through a generic sample. Existing settings continue to use Sampled mode; LZX remains the default algorithm.
+- A measured retention policy: require the configured percentage reduction and at least one NTFS cluster of savings, otherwise restore the newly compressed file. Report failed measurements and restoration failures explicitly.
+- File-identity-aware WOF inspection, guarded normal-view allocation queries, canonical-root containment checks, hardlink protection and cooperative per-file locking between Compactor instances.
+- Persistent operation reports, bounded error details, behaviour tests for the embedded UI and explicit native Windows/NTFS integration tests.
+- Support for checking Windows sources with a real MinGW cross-toolchain, without bypassing resource compilation.
+
+### Fixed
+
+- Recognise actual WOF backing before rejecting sparse/reparse metadata. Do not infer the compression format from a size comparison.
+- Validate Windows API response lengths, versions, providers and algorithm identifiers; accept the existing XPRESS4K setting consistently.
+- Scope the incompressible cache to file fingerprint, algorithm, mode, threshold and cluster size; cache only measured negative results from the protected identity.
+- Preserve pending cache entries after write/flush/sync failures and recover from truncated or missing cache files.
+- Stop scheduling work when the GUI closes, including while paused. Prioritise cancellation over an already-ready analysis/preflight result.
+- Process each original decompression candidate at most once per run, retaining failed WOF files for inspection and a later retry.
+- Invalidate stale analyses after settings changes and require new analysis after decompression or errors.
+- Detect DirectStorage signals independently of compression exclusions, support cancelling the preflight and refuse to compress after an incomplete check.
+- Save configuration atomically and validate it on load. Preserve invalid configuration bytes until the user saves a corrected configuration.
+- Escape automatically added folder exclusions, reject invalid numeric settings, reset empty charts and refresh displayed units and file/folder views correctly.
+
+### Changed
+
+- Update `crossbeam-channel` from 0.5.0 to 0.5.17 and its `crossbeam-utils` dependency from 0.8.1 to 0.8.23, with the resolved versions recorded in Cargo.lock.
+- Removed uncalibrated algorithm-specific estimate multipliers; estimates are explicitly generic and provisional.
+- Native WOF tests use temporary fixtures instead of modifying Cargo.lock or scanning a user's C:\Games directory.
+- CI and release workflows run interface tests, workspace tests and explicit WOF round-trip checks before publishing artifacts.
+
 ## [0.11.5] - 2026-09-14
 
 ### Added

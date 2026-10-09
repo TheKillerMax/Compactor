@@ -12,6 +12,7 @@ mod directstorage;
 mod folder;
 mod gui;
 mod persistence;
+mod policy;
 
 fn setup_panic() {
     std::panic::set_hook(Box::new(|e| {
